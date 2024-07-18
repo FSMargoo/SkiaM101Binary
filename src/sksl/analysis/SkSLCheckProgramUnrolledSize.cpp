@@ -197,11 +197,6 @@ bool Analysis::CheckProgramUnrolledSize(const Program& program) {
             // Visit every function--we want to detect static recursion and report it as an error,
             // even in unreferenced functions.
             visitor.visitProgramElement(*element);
-            // Report an error when main()'s flattened size is larger than our program limit.
-            if (visitor.functionSize() > kProgramSizeLimit &&
-                element->as<FunctionDefinition>().declaration().isMain()) {
-                context.fErrors->error(Position(), "program is too large");
-            }
         }
     }
 

@@ -19,12 +19,68 @@
 #include <optional>
 #include <string_view>
 
+#include <map>
+#include <vector>
+
 namespace SkSL {
 
 class ErrorReporter;
 struct Modifiers;
 struct ParsedModule;
 class SymbolTable;
+
+// SkSLPP BEGIN
+enum class SkSLMarcoType {
+    None, Alias, FunctionAlias
+};
+class SkSLPPMarcoUnit {
+public:
+    SkSLPPMarcoUnit() = default;
+    ~SkSLPPMarcoUnit() = default;
+
+public:
+    SkSLMarcoType MarcoType = SkSLMarcoType::None;
+    std::string Origin;
+    std::string ID;
+    std::string Conduct(std::map<std::string, std::string> ReplaceMap) {
+        std::string newString = Origin;
+        for (auto& item : ReplaceMap) {
+            Replace(newString, "@@\"${__" + item.first + "}\"@@", item.second);
+        }
+
+        return newString;
+    }
+
+private:
+    static void Replace(std::string& Input, const std::string& OStr, const std::string& TStr) {
+        int Position = Input.find(OStr);
+        while (Position != std::string::npos) {
+            Input.replace(Position, OStr.size(), TStr);
+
+            Position = Input.find(OStr, Position + 1);
+        }
+    }
+};
+class SkSLPPMarcoManager {
+public:
+    SkSLPPMarcoManager() = default;
+    ~SkSLPPMarcoManager() = default;
+
+public:
+    SkSLPPMarcoUnit* FindMarco(const std::string& ID) {
+        for (auto& item : MarcoList) {
+            if (item.ID == ID) {
+                return &item;
+            }
+        }
+
+        return nullptr;
+    }
+
+public:
+    std::vector<SkSLPPMarcoUnit> MarcoList;
+};
+// SkSLPP END
 
 /**
  * Consumes .sksl text and invokes DSL functions to instantiate the program.
@@ -57,6 +113,16 @@ public:
     Position position(Token token);
 
     Position position(int line);
+
+private:
+    /**
+     * The pre-scan of #define, added by SkSL+
+    */
+    void PreDefineScan();
+    /**
+     * Parse the #define command, added by SkSL+
+     */
+    bool DealyWithDefine();
 
 private:
     static void InitLayoutMap();
@@ -250,6 +316,21 @@ private:
 
     dsl::DSLExpression term();
 
+    // SkSL++ BEGIN
+    /**
+     * Fetch the parameter of the marco function
+     */
+    std::map<std::string, std::string> FetchMarcoFunctionParameter();
+    /**
+     * Read the marco function
+     */
+    std::map<std::string, std::string> ReadMarcoFunction();
+    /**
+     * Get the raw string of the marco context
+     */
+    std::string GetRawString(std::map<std::string, std::string> ReplaceParameter);
+    // SkSL++ END
+
     bool intLiteral(SKSL_INT* dest);
 
     bool floatLiteral(SKSL_FLOAT* dest);
@@ -342,6 +423,9 @@ private:
 
     friend class AutoDSLDepth;
     friend class HCodeGenerator;
+
+    SkSLPPMarcoManager marcoManager;
+    std::map<std::string, std::string> aliasMap;
 };
 
 }  // namespace SkSL

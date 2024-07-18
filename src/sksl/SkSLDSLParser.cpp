@@ -104,6 +104,14 @@ DSLParser::DSLParser(Compiler* compiler, const ProgramSettings& settings, Progra
     , fKind(kind)
     , fText(std::make_unique<std::string>(std::move(text)))
     , fPushback(Token::Kind::TK_NONE, /*offset=*/-1, /*length=*/-1) {
+    // SkSL++ BEGIN
+    PreDefineScan();
+
+    fSettings = (settings);
+    fKind = (kind);
+    fPushback = SkSL::Token(Token::Kind::TK_NONE, /*offset=*/-1, /*length=*/-1);
+    // SkSL++ END
+
     // We don't want to have to worry about manually releasing all of the objects in the event that
     // an error occurs
     fSettings.fAssertDSLObjectsReleased = false;
@@ -252,7 +260,7 @@ void DSLParser::error(Position position, std::string msg) {
 /* declaration* END_OF_FILE */
 std::unique_ptr<Program> DSLParser::program() {
     ErrorReporter* errorReporter = &fCompiler.errorReporter();
-    Start(&fCompiler, fKind, fSettings);
+    // Start(&fCompiler, fKind, fSettings);
     SetErrorReporter(errorReporter);
     errorReporter->setSource(*fText);
     this->declarations();
@@ -279,6 +287,346 @@ SkSL::LoadedModule DSLParser::moduleInheritingFrom(SkSL::ParsedModule baseModule
     return result;
 }
 
+void DSLParser::PreDefineScan() {
+    fSettings.fAssertDSLObjectsReleased = false;
+    fSettings.fDSLMangling = false;
+    fLexer.start(*fText);
+
+    ErrorReporter* errorReporter = &fCompiler.errorReporter();
+    Start(&fCompiler, fKind, fSettings);
+    SetErrorReporter(errorReporter);
+    errorReporter->setSource(*fText);
+
+    // 复制一手原来的代码
+    std::string newText = *fText.get();
+
+    fEncounteredFatalError = false;
+    bool done = false;
+
+    // 删除后其他地方额外需要的 offset
+    int additionOffset = 0;
+    while (!done) {
+        auto token = this->peek();
+        switch (token.fKind) {
+            case Token::Kind::TK_END_OF_FILE:
+                done = true;
+                break;
+            case Token::Kind::TK_DIRECTIVE: {
+                auto start = token.fOffset;
+                auto flag = this->DealyWithDefine();
+                auto length = fLexer.getCheckpoint().fOffset - start;
+                // 直接把 #define 的代码删去
+                if (flag) {
+                    newText.replace(start - additionOffset, length, "");
+                }
+                additionOffset += length;
+
+                break;
+            }
+            case Token::Kind::TK_IDENTIFIER: {
+                // bro 可能是宏
+                auto id = std::string(this->text(token));
+                // 检查一波
+                auto marco = marcoManager.FindMarco(std::string(id));
+                // 展开后的代码
+                std::string expandString;
+                // 别名优先级大于宏
+                if (aliasMap.find(id) != aliasMap.end()) {
+                    newText.replace(token.fOffset - additionOffset, id.length(), aliasMap[id]);
+
+                    additionOffset += id.length() - aliasMap[id].length();
+                }
+                else if (marco != nullptr) {
+                    // 如果是单纯字面量，那好办
+                    if (marco->MarcoType == SkSLMarcoType::Alias) {
+                        expandString = " " + marco->Origin + " ";
+
+                        // 替换
+                        newText.replace(token.fOffset - additionOffset, id.length(), expandString);
+
+                        additionOffset += id.length() - expandString.length();
+                    } else {
+                        this->nextToken();
+                        // 如果是函数宏，那么就需要展开
+                        auto replaceList = ReadMarcoFunction();
+                        expandString = " " + marco->Conduct(replaceList) + " ";
+
+                        // 替换
+                        auto start  = token.fOffset;
+                        auto length = fLexer.getCheckpoint().fOffset - start;
+                        newText.replace(start - additionOffset, length, expandString);
+
+                        additionOffset += length - expandString.length();
+                    }
+                }
+                else {
+                    expandString = " " + std::string(id) + " ";
+                }
+
+                break;
+            }
+        }
+        token = this->nextToken();
+    }
+
+    // 替换掉原来的程序
+    fText = std::make_unique<std::string>(newText);
+}
+bool DSLParser::DealyWithDefine() {
+    Token start;
+    if (!this->expect(Token::Kind::TK_DIRECTIVE, "a directive", &start)) {
+        return false;
+    }
+    std::string_view text = this->text(start);
+    const bool allowExtensions = !ProgramConfig::IsRuntimeEffect(fKind);
+    if (text == "#extension" && allowExtensions) {
+        // 此处不处理 #extension
+    } else if (text == "#define") {
+        SkSLPPMarcoUnit marcoUnit;
+        // 此处不在考虑空宏，不会真的有人在 shader 里头写个空的宏吧...
+        Token name;
+        if (!this->expectIdentifier(&name)) {
+            return false;
+        }
+        marcoUnit.ID = this->text(name);
+
+        Token next = this->peek();
+        // 如果只是简单的别名
+        if (next.fKind == Token::Kind::TK_INT_LITERAL || next.fKind == Token::Kind::TK_FLOAT_LITERAL) {
+            // 直接存就行了
+            marcoUnit.MarcoType = SkSLMarcoType::Alias;
+            marcoUnit.Origin = this->text(next);
+            marcoManager.MarcoList.push_back(marcoUnit);
+        }
+        // 左括号，说明是函数宏
+        else if (next.fKind == Token::Kind::TK_LPAREN) {
+            // 获取参数替换列表
+            auto parameterReplaceList = FetchMarcoFunctionParameter();
+            // 获取宏的展开待替换表达式
+            marcoUnit.MarcoType = SkSLMarcoType::FunctionAlias;
+
+            marcoUnit.Origin = GetRawString(parameterReplaceList);
+
+            marcoManager.MarcoList.push_back(marcoUnit);
+        }
+        else {
+            // 直接报错就成
+            this->error(start, "SkSL++ Parser Error : Unknown token '" + std::string(this->text(next)) + "'");
+        }
+
+        return true;
+    }
+    else if (text == "#alias") {
+        // 处理别名
+        Token name;
+        if (!this->expectIdentifier(&name)) {
+            return false;
+        }
+        aliasMap.insert({ std::string(this->text(name)), GetRawString({
+            { "$", "$" }
+        })});
+        return true;
+    }
+    else {
+        this->error(start, "SkSL++ Parser Error : Unknown pre command '" + std::string(this->text(start)) + "'");
+    }
+
+    return false;
+}
+std::string DSLParser::GetRawString(std::map<std::string, std::string> ReplaceParameter) {
+    fEncounteredFatalError = false;
+    bool done = false;
+    std::string rawString;
+    int level = 0;
+    while (!done) {
+        auto token = this->peek();
+        switch (token.fKind) {
+            case Token::Kind::TK_END_OF_FILE:
+                // Bro 又写 bug 了？
+                done = true;
+
+                this->error(token, "Bracket dosen't compare.");
+
+                break;
+            case Token::Kind::TK_LPAREN:
+                ++level;
+                if (level != 1) {
+                    rawString += "(";
+                }
+                break;
+            case Token::Kind::TK_RPAREN:
+                if (level == 1) {
+                    done = true;
+                }
+                else {
+                    rawString += ")";
+                }
+                
+                --level;
+
+                break;
+            default:
+                if (token.fKind == Token::Kind::TK_IDENTIFIER) {
+                    auto name = std::string(this->text(token));
+                    auto marco = marcoManager.FindMarco(std::string(this->text(token)));
+                    // 如果是宏内套宏，那么就展开
+                    if (marco != nullptr) {
+                        // 如果是单纯字面量，那好办
+                        if (marco->MarcoType == SkSLMarcoType::Alias) {
+                            rawString += " " + marco->Origin + " ";
+                        } else {
+                            // 如果是函数宏，那么就需要展开
+                            auto replaceList = ReadMarcoFunction();
+                            rawString += " " + marco->Conduct(replaceList) + " ";
+                        }
+                    }
+                    else if (ReplaceParameter.find(name) != ReplaceParameter.end()) {
+                        rawString += " @@\"${__" + ReplaceParameter[name] + "}\"@@ ";
+                    }
+                    else {
+                        rawString += " " + name + " ";
+                    }
+                }
+                else {
+                    rawString += " " + std::string(this->text(token)) + " ";
+                }
+
+                break;
+        }
+        if (!done) {
+            token = this->nextToken();
+        }
+    }
+
+    return rawString;
+}
+std::map<std::string, std::string> DSLParser::ReadMarcoFunction() {
+    fEncounteredFatalError = false;
+    bool done = false;
+    std::map<std::string, std::string> replace;
+    std::string rawString;
+    int level = 0;
+    int count = 0;
+    while (!done) {
+        auto token = this->peek();
+        switch (token.fKind) {
+            case Token::Kind::TK_IDENTIFIER: {
+                // 检查嵌套
+
+                // bro 可能是宏
+                auto id = std::string(this->text(token));
+                // 检查一波
+                auto marco = marcoManager.FindMarco(std::string(id));
+                // 展开后的代码
+                std::string expandString;
+                // 别名优先级大于宏
+                if (aliasMap.find(id) != aliasMap.end()) {
+                    expandString = aliasMap[id];
+                }
+                else if (marco != nullptr) {
+                    // 如果是单纯字面量，那好办
+                    if (marco->MarcoType == SkSLMarcoType::Alias) {
+                        expandString = " " + marco->Origin + " ";
+                    } else {
+                        this->nextToken();
+                        // 如果是函数宏，那么就需要展开
+                        auto replaceList = ReadMarcoFunction();
+                        expandString = " " + marco->Conduct(replaceList) + " ";
+
+                        // 替换
+                        auto start  = token.fOffset;
+                        auto length = fLexer.getCheckpoint().fOffset - start;
+                    }
+                }
+                else {
+                    expandString = " " + std::string(id) + " ";
+                }
+
+                rawString += expandString;
+
+                break;
+            }
+            case Token::Kind::TK_LPAREN:
+                ++level;
+                if (level != 1) {
+                    rawString += "(";
+                }
+                break;
+            case Token::Kind::TK_RPAREN:
+                if (level == 1) {
+                    replace.insert({ "X" + std::to_string(count), rawString });
+                    done = true;
+                }
+                else {
+                    rawString += ")";
+                }
+                
+                --level;
+
+                break;
+            case Token::Kind::TK_END_OF_FILE:
+                // Bro 又写 bug 了？
+                done = true;
+
+                this->error(token, "Bracket dosen't compare.");
+
+                break;
+            case Token::Kind::TK_COMMA:
+                if (level == 1) {
+                    // 添加到 replace list 中
+                    replace.insert({ "X" + std::to_string(count), rawString });
+
+                    rawString.clear();
+
+                    ++count;
+                }
+                else {
+                    rawString += ",";
+                }
+
+                break;
+            default:
+                rawString += " " + std::string(this->text(token)) + " ";
+
+                break;
+        }
+        token = this->nextToken();
+    }
+
+    return replace;
+}
+std::map<std::string, std::string> DSLParser::FetchMarcoFunctionParameter() {
+    fEncounteredFatalError = false;
+    bool done = false;
+    int count = 0;
+    std::map<std::string, std::string> replaceList;
+    // 这里直接不检查逗号分割都行的
+    // Bro 真的不想管你语法写对没
+    while (!done) {
+        auto token = this->nextToken();
+        switch (token.fKind) {
+            case Token::Kind::TK_IDENTIFIER:
+                replaceList.insert({ std::string(this->text(token)), "X" + std::to_string(count) });
+
+                ++count;
+
+                break;
+            case Token::Kind::TK_END_OF_FILE:
+                // Bro 又写 bug 了？
+                done = true;
+
+                this->error(token, "Bracket dosen't compare.");
+
+                break;
+            case Token::Kind::TK_RPAREN:
+                done = true;
+                break;
+        }
+    }
+    return replaceList;
+}
+
+// 对预定义等进行预处理。
 void DSLParser::declarations() {
     fEncounteredFatalError = false;
     bool done = false;
@@ -333,7 +681,10 @@ void DSLParser::directive() {
         }
         // We don't currently do anything different between require, enable, and warn
         dsl::AddExtension(this->text(name));
-    } else {
+    } else if (text == "#define") {
+        // 我们先跳过对 #define 的检查
+    }
+    else {
         this->error(start, "unsupported directive '" + std::string(this->text(start)) + "'");
     }
 }
